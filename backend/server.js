@@ -1,7 +1,9 @@
 // backend/server.js
 // Exam schedules are typed as local time; make the server interpret them in the
 // institute's timezone even when hosted on a UTC cloud machine. Override with TZ in .env.
-process.env.TZ = process.env.TZ || "Asia/Kolkata";
+// Vercel presets TZ to ":UTC", which Intl rejects ("Invalid time zone"). Accept only a real zone name.
+{ const z = (process.env.TZ || "").replace(/^:/, "");
+  process.env.TZ = (z && z !== "UTC" && z !== "Etc/UTC") ? z : "Asia/Kolkata"; }
 // Password hashing (pbkdf2) runs on libuv's thread pool (default 4 threads). A classroom logging in
 // at the same second would queue behind it, so give it more threads.
 process.env.UV_THREADPOOL_SIZE = process.env.UV_THREADPOOL_SIZE || "16";
