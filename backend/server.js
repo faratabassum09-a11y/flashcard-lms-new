@@ -45,6 +45,7 @@ if (!process.env.MONGO_URI || !process.env.SESSION_SECRET) {
   process.exit(1);
 }
 
+const ON_VERCEL = !!process.env.VERCEL;
 const app = express();
 const isProd = process.env.NODE_ENV === "production";
 if (isProd || process.env.TRUST_PROXY) app.set("trust proxy", 1);   // correct client IP / secure cookies behind nginx, Render, etc.
@@ -52,7 +53,7 @@ app.disable("x-powered-by");
 app.use(compression());                      // gzip every HTML/CSS/JS/JSON response (typically 70-80% smaller)
 
 // ── Database ── bigger pool so ~200 simultaneous students are not queued behind 5 connections
-mongoose.connect(process.env.MONGO_URI, { maxPoolSize: 50, minPoolSize: 5, serverSelectionTimeoutMS: 15000 })
+mongoose.connect(process.env.MONGO_URI, ON_VERCEL ? { maxPoolSize: 10, serverSelectionTimeoutMS: 15000 } : { maxPoolSize: 50, minPoolSize: 5, serverSelectionTimeoutMS: 15000 })
   .then(async () => {
     console.log("MongoDB connected");
     try {
@@ -117,7 +118,7 @@ app.use(session({
     maxAge:   1000 * 60 * 60 * 24 * 7,
     httpOnly: true,
     sameSite: "lax",
-    secure:   process.env.COOKIE_SECURE === "true"     // set COOKIE_SECURE=true when served over HTTPS
+    secure:   process.env.COOKIE_SECURE ? process.env.COOKIE_SECURE === "true" : ON_VERCEL     // set COOKIE_SECURE=true when served over HTTPS
   }
 }));
 
@@ -186,11 +187,13 @@ app.post("/login", loginLimiter);
 app.post("/test/:id/draft", draftLimiter);
 app.post("/check-answer", checkAnswerLimiter);
 
-// ── Test scheduler (every minute) ── 3 bulk updates instead of loading every active test into memory
-let cronRunning = false;
-cron.schedule("* * * * *", async () => {
-  if (cronRunning || mongoose.connection.readyState !== 1) return;
-  cronRunning = true;
+// ── Background jobs ──
+// Render/VPS: node-cron runs them every minute. Vercel (serverless, no always-on process): they run
+// opportunistically on incoming requests (throttled) and from /api/cron (daily Vercel cron as a backstop).
+let schedRunning = false;
+async function runScheduler() {
+  if (schedRunning || mongoose.connection.readyState !== 1) return;
+  schedRunning = true;
   try {
     const now = new Date();
     await Test.updateMany(
@@ -212,14 +215,14 @@ cron.schedule("* * * * *", async () => {
   } catch (err) {
     console.error("Scheduler error:", err.message);
   } finally {
-    cronRunning = false;
+    schedRunning = false;
   }
-});
+}
 
-// ── Safety net (every minute) ── a student whose browser died / battery ran out / network dropped at the end
+// Safety net: a student whose browser died / battery ran out / network dropped at the end
 // still gets a result: their last autosaved answers are marked once the test is over.
 let draftsRunning = false;
-cron.schedule("* * * * *", async () => {
+async function runDraftFinalizer() {
   if (draftsRunning || mongoose.connection.readyState !== 1) return;
   draftsRunning = true;
   try {
@@ -230,7 +233,27 @@ cron.schedule("* * * * *", async () => {
   } finally {
     draftsRunning = false;
   }
-});
+}
+
+if (!ON_VERCEL) {
+  cron.schedule("* * * * *", runScheduler);
+  cron.schedule("* * * * *", runDraftFinalizer);
+} else {
+  let lastTick = 0;
+  app.use((req, res, next) => {            // at most once per 20 s per warm instance; never delays the response
+    const now = Date.now();
+    if (now - lastTick > 20000 && !req.path.startsWith("/css") && !req.path.startsWith("/js")) {
+      lastTick = now;
+      runScheduler().then(runDraftFinalizer).catch(() => {});
+    }
+    next();
+  });
+  app.get("/api/cron", async (req, res) => {   // Vercel cron sends "Authorization: Bearer $CRON_SECRET"
+    if (process.env.CRON_SECRET && req.get("authorization") !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).send("no");
+    await runScheduler(); await runDraftFinalizer();
+    res.send("ok");
+  });
+}
 
 // ── Routes ──
 app.get("/", (req, res) => res.redirect(req.isAuthenticated() ? "/dashboard" : "/login"));
@@ -249,11 +272,12 @@ app.use((err, req, res, next) => {
   res.status(statusCode).render("error", { title: "Error", err: statusCode >= 500 && isProd ? { statusCode, message: "Something went wrong" } : err });
 });
 
-const PORT = process.env.PORT || 5000;
-const server = app.listen(PORT, "0.0.0.0", () => console.log(`Server running on ${PORT} (TZ=${process.env.TZ})`));
-server.keepAliveTimeout = 65 * 1000;
-
+if (!ON_VERCEL) {
+  const PORT = process.env.PORT || 5000;
+  const server = app.listen(PORT, "0.0.0.0", () => console.log(`Server running on ${PORT} (TZ=${process.env.TZ})`));
+  server.keepAliveTimeout = 65 * 1000;
+  process.on("SIGTERM", () => server.close(() => mongoose.connection.close().then(() => process.exit(0))));
+}
 process.on("unhandledRejection", (e) => console.error("Unhandled rejection:", e));
-process.on("SIGTERM", () => server.close(() => mongoose.connection.close().then(() => process.exit(0))));
 
 module.exports = app;
